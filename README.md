@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/TagPorter_logo.jpeg" alt="TagPorter logo" width="250">
+</p>
+
 # TagPorter
 
 A high-performance Rust tool for transferring auxiliary tags from source BAM files to aligned BAM files. Originally designed for methylation tags (MM, ML) but generalized to support any BAM auxiliary tags.
