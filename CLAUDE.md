@@ -51,13 +51,13 @@ The tool uses a **three-phase pipeline** with an embedded [Sled](https://github.
 
 1. **`collect_tags()`** — Reads N unaligned BAMs, extracts requested auxiliary tags, serializes them with `postcard`, and batch-writes to the Sled database. The key is the read name followed by a one-byte mate suffix (`record_key()`), so the two mates of a pair — which share a QNAME — do not collide. Secondary/supplementary source records are skipped so their clipped tags cannot overwrite the primary's. Batches of 10,000 records are written atomically.
 
-2. **`write_new_bam()`** — Reads the aligned BAM sequentially, looks up each record's mate-aware key in Sled, deserializes matched tags, pushes them onto the record, and writes to the output BAM. Only primary alignments are tagged; secondary/supplementary alignments are written through unchanged (counted in `TransferStats::reads_secondary_supplementary`). CRAM I/O honors `--reference` via `set_reference()` on the reader/writer. Optionally builds a BAI/CSI index afterward (skipped for SAM output, which cannot be indexed).
+2. **`write_new_bam()`** — First refuses to run if `output` is the same file as the aligned input (`ensure_output_distinct()`, which compares device/inode so `..`, symlink and hard-link aliases are caught; `main()` also checks the source BAMs before collecting). Reads the aligned BAM sequentially, looks up each record's mate-aware key in Sled, deserializes matched tags, pushes them onto the record, and writes to the output BAM. Base-modification tags (`MOD_TAGS`: MM/ML/MN and legacy Mm/Ml) are dropped for a read whose SEQ length differs from the source's, or whose source MN disagrees with the source SEQ (`--on-length-mismatch`, counted in `TransferStats::reads_length_mismatch`); other tags still transfer. Only primary alignments are tagged; secondary/supplementary alignments are written through unchanged (counted in `TransferStats::reads_secondary_supplementary`). CRAM I/O honors `--reference` via `set_reference()` on the reader/writer. Optionally builds a BAI/CSI index afterward (skipped for SAM output, which cannot be indexed).
 
 3. **Cleanup** — The binary owns the Sled DB as a uniquely-named `tempfile::TempDir` (created next to `--aln`, or in `--tmp-folder`), so it is removed on every exit path — success or error — via RAII. The library functions never delete a caller-supplied directory. Unique names let concurrent runs share a directory without colliding.
 
 ### Key Data Structures
 
-- **`TagData`** — `HashMap<[u8; 2], SerializableAux>` for flexible multi-tag storage per read.
+- **`TagData`** — `HashMap<[u8; 2], SerializableAux>` for flexible multi-tag storage per read, plus the source `seq_len` used to validate base-modification tags.
 - **`SerializableAux`** — Enum mirroring all 15+ `rust_htslib::bam::record::Aux` variants, enabling `serde`/`postcard` serialization. Conversion in/out via `convert_aux_to_serializable()` and `push_aux()`.
 
 ### Performance Design Decisions
@@ -82,11 +82,12 @@ Required:
   --output <OUTPUT>         Output path; format auto-detected from extension (.bam/.cram/.sam)
 
 Optional:
-  --tags <TAGS>             Comma-separated 2-char tag names [default: MM,ML]
+  --tags <TAGS>             Comma-separated 2-char tag names [default: MM,ML,MN]
   --threads <N>             htslib thread count [default: 1]
   --no-index                Skip index building
   --index-format bai|csi    Index type — use csi for contigs >512 Mb [default: bai]
   --on-conflict skip|overwrite|error  Tag conflict behavior [default: skip]
+  --on-length-mismatch skip|error    SEQ length differs from source: drop MM/ML/MN or abort [default: skip]
   --reference <FASTA>       Reference FASTA (required for CRAM input/output)
   --cache-mb <MB>           Sled cache in MB [default: 4096]
   --tmp-folder <DIR>        Temp dir for Sled DB (e.g. /dev/shm)

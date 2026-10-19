@@ -99,11 +99,12 @@ tagporter \
 | `--aln` | Aligned BAM/CRAM to add tags to | — | Yes |
 | `--source-bams` | Space-separated source BAM files containing the tags to transfer | — | Yes |
 | `--output` | Output path (format auto-detected from extension: `.bam`, `.cram`, `.sam`) | — | Yes |
-| `--tags` | Comma-separated list of 2-character tag names to copy | `MM,ML` | No |
+| `--tags` | Comma-separated list of 2-character tag names to copy | `MM,ML,MN` | No |
 | `--threads` | Number of threads for BAM I/O | `1` | No |
 | `--no-index` | Skip building an index for the output file | `false` | No |
 | `--index-format` | Index format for BAM output: `bai` or `csi` (use `csi` for contigs >512 Mb). CRAM output always gets a `.crai` index; SAM output is not indexed | `bai` | No |
 | `--on-conflict` | Behavior when a tag already exists on the aligned record: `skip`, `overwrite`, or `error` | `skip` | No |
+| `--on-length-mismatch` | Behavior when an aligned read's sequence length differs from its source read: `skip` (drop that read's MM/ML/MN, transfer other tags) or `error` | `skip` | No |
 | `--reference` | Reference FASTA file (required when reading or writing CRAM) | — | No |
 | `--cache-mb` | Sled database cache capacity in MB | `4096` | No |
 | `--tmp-folder` | Directory for the temporary Sled database (use `/dev/shm` on Linux for best performance) | Next to `--aln` | No |
@@ -111,7 +112,7 @@ tagporter \
 
 ### Examples
 
-#### Copy methylation tags (MM/ML) — default behavior
+#### Copy methylation tags (MM/ML/MN) — default behavior
 
 ```bash
 tagporter \
@@ -119,6 +120,8 @@ tagporter \
   --source-bams unmapped.bam \
   --output output.bam
 ```
+
+MM positions are counted along the read sequence, so they are only valid on an aligned read with the same sequence length as its source. If a primary alignment is hard-clipped, or the read was trimmed before alignment, TagPorter does not transfer its MM/ML/MN (other requested tags are still transferred), logs a warning, and reports how many reads were affected. Use `--on-length-mismatch error` to stop instead. `MN` (the sequence length MM/ML were computed for, written by current basecallers) is copied too, so htslib-based tools can reject the tags if the output is later clipped or trimmed by other tools.
 
 #### Copy custom tags
 
