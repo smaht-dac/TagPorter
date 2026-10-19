@@ -109,8 +109,6 @@ tagporter \
 | `--tmp-folder` | Directory for the temporary Sled database (use `/dev/shm` on Linux for best performance) | Next to `--aln` | No |
 | `--quiet` | Suppress informational output (warnings and errors still shown) | `false` | No |
 
-> **Note:** `--methyl-bams` is accepted as a hidden alias for `--source-bams` for backward compatibility.
-
 ### Examples
 
 #### Copy methylation tags (MM/ML) — default behavior

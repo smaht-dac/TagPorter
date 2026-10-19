@@ -78,7 +78,7 @@ The tool uses a **three-phase pipeline** with an embedded [Sled](https://github.
 ```
 Required:
   --aln <ALN>               Aligned BAM/CRAM to add tags to
-  --source-bams <BAMS>...   Source BAMs containing the tags to transfer (alias: --methyl-bams)
+  --source-bams <BAMS>...   Source BAMs containing the tags to transfer
   --output <OUTPUT>         Output path; format auto-detected from extension (.bam/.cram/.sam)
 
 Optional:

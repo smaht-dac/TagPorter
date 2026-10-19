@@ -11,7 +11,7 @@ struct Cli {
     aln: PathBuf,
 
     /// Source BAM files containing the tags to transfer
-    #[arg(long, alias = "methyl-bams", required = true, value_parser, num_args = 1.., value_delimiter = ' ')]
+    #[arg(long, required = true, value_parser, num_args = 1.., value_delimiter = ' ')]
     source_bams: Vec<PathBuf>,
 
     /// Comma-separated list of 2-character tag names to copy (e.g., MM,ML,RG)
