@@ -102,7 +102,7 @@ tagporter \
 | `--tags` | Comma-separated list of 2-character tag names to copy | `MM,ML` | No |
 | `--threads` | Number of threads for BAM I/O | `1` | No |
 | `--no-index` | Skip building an index for the output file | `false` | No |
-| `--index-format` | Index format: `bai` or `csi` (use `csi` for contigs >512 Mb) | `bai` | No |
+| `--index-format` | Index format for BAM output: `bai` or `csi` (use `csi` for contigs >512 Mb). CRAM output always gets a `.crai` index; SAM output is not indexed | `bai` | No |
 | `--on-conflict` | Behavior when a tag already exists on the aligned record: `skip`, `overwrite`, or `error` | `skip` | No |
 | `--reference` | Reference FASTA file (required when reading or writing CRAM) | — | No |
 | `--cache-mb` | Sled database cache capacity in MB | `4096` | No |
@@ -194,8 +194,10 @@ tagporter \
    - Writes modified record to output file
    - Reports a transfer summary (reads tagged, unmatched, conflicts)
 
-3. **Indexing Phase** (optional): Creates BAI or CSI index for the output file
-   - Use `--index-format csi` for genomes with contigs larger than 512 Mb
+3. **Indexing Phase** (optional): Creates an index for the output file
+   - BAM output gets a BAI index by default; use `--index-format csi` for genomes with contigs larger than 512 Mb
+   - CRAM output always gets a `.crai` index (`--index-format` is ignored)
+   - SAM output cannot be indexed and is skipped with a warning
    - Skip entirely with `--no-index`
 
 ## Verbosity
