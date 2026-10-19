@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
-use tagporter::{collect_tags, write_new_bam, ConflictMode, IndexFormat};
+use tagporter::{
+    collect_tags, ensure_output_distinct, write_new_bam, ConflictMode, IndexFormat,
+    LengthMismatchMode,
+};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -14,8 +17,8 @@ struct Cli {
     #[arg(long, required = true, value_parser, num_args = 1.., value_delimiter = ' ')]
     source_bams: Vec<PathBuf>,
 
-    /// Comma-separated list of 2-character tag names to copy (e.g., MM,ML,RG)
-    #[arg(long, value_delimiter = ',', default_value = "MM,ML")]
+    /// Comma-separated list of 2-character tag names to copy (e.g., MM,ML,MN,RG)
+    #[arg(long, value_delimiter = ',', default_value = "MM,ML,MN")]
     tags: Vec<String>,
 
     /// Output BAM/CRAM/SAM path (format auto-detected from extension)
@@ -37,6 +40,11 @@ struct Cli {
     /// Behavior when a tag already exists on an aligned record
     #[arg(long, value_enum, default_value = "skip")]
     on_conflict: ConflictMode,
+
+    /// Behavior when an aligned read's SEQ length differs from its source read,
+    /// which would make base-modification tags (MM/ML/MN) point at the wrong bases
+    #[arg(long, value_enum, default_value = "skip")]
+    on_length_mismatch: LengthMismatchMode,
 
     /// Reference FASTA file (required when reading or writing CRAM)
     #[arg(long)]
@@ -73,6 +81,13 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    // Fail before the (potentially long) collect phase rather than at write time,
+    // and protect the source BAMs too, not just --aln.
+    let inputs: Vec<&std::path::Path> = std::iter::once(cli.aln.as_path())
+        .chain(cli.source_bams.iter().map(PathBuf::as_path))
+        .collect();
+    ensure_output_distinct(&cli.output, &inputs)?;
 
     // Place the temp Sled DB next to --aln by default (same, usually large,
     // filesystem as the data), or in --tmp-folder if given. A uniquely-named
@@ -128,6 +143,7 @@ fn main() -> Result<()> {
         cli.no_index,
         cli.index_format,
         cli.on_conflict,
+        cli.on_length_mismatch,
         cli.cache_mb,
         cli.reference.as_deref(),
     )
@@ -160,7 +176,7 @@ fn main() -> Result<()> {
     }
     if stats.reads_matched_no_new_tags > 0 {
         log::info!(
-            "  {} matched read(s) received no new tag (all requested tags already present)",
+            "  {} matched read(s) received no new tag (tags already present or dropped for length mismatch)",
             stats.reads_matched_no_new_tags
         );
     }
@@ -168,6 +184,14 @@ fn main() -> Result<()> {
         log::info!(
             "  {} tag(s) skipped due to conflicts (--on-conflict=skip)",
             stats.tags_skipped_conflict
+        );
+    }
+    if stats.reads_length_mismatch > 0 {
+        log::warn!(
+            "  {} read(s) ({:.1}%) had base-modification tags dropped: SEQ length differs from the source ({} explained by hard clipping)",
+            stats.reads_length_mismatch,
+            stats.reads_length_mismatch as f64 / stats.total_aligned as f64 * 100.0,
+            stats.reads_length_mismatch_hard_clipped
         );
     }
     if stats.reads_secondary_supplementary > 0 {

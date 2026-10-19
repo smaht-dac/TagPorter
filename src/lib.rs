@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use rust_htslib::bam::index;
-use rust_htslib::bam::record::Aux;
+use rust_htslib::bam::record::{Aux, Cigar};
 use rust_htslib::bam::{self, Read};
 use serde::{Deserialize, Serialize};
 use sled;
@@ -14,7 +14,17 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize, Debug)]
 struct TagData {
     tags: HashMap<[u8; 2], SerializableAux>,
+    /// SEQ length of the source record, used to validate base-modification tags.
+    seq_len: u32,
 }
+
+/// Base-modification tags, whose MM positions are counted along SEQ. They are
+/// only valid on a record whose SEQ has the same length as the source's
+/// (`Mm`/`Ml` are the legacy names htslib still accepts).
+const MOD_TAGS: [[u8; 2]; 5] = [*b"MM", *b"ML", *b"MN", *b"Mm", *b"Ml"];
+
+/// How many length mismatches are logged individually before only counting.
+const MAX_LENGTH_MISMATCH_WARNINGS: u64 = 5;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum SerializableAux {
@@ -56,10 +66,20 @@ pub enum ConflictMode {
     Error,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum LengthMismatchMode {
+    /// Drop the base-modification tags (MM/ML/MN) for that read; transfer the rest
+    Skip,
+    /// Abort with an error on the first mismatch
+    Error,
+}
+
 /// Counts reported after a completed tag-transfer run. For a completed run the
 /// four outcome buckets partition `total_aligned` exactly:
 /// `reads_tagged + reads_unmatched + reads_matched_no_new_tags
 /// + reads_secondary_supplementary == total_aligned`.
+/// `tags_skipped_conflict` and the `reads_length_mismatch*` counters are extra
+/// detail, not buckets of their own.
 #[derive(Debug)]
 pub struct TransferStats {
     pub total_aligned: u64,
@@ -70,13 +90,35 @@ pub struct TransferStats {
     /// Individual tags skipped because they already existed (`--on-conflict=skip`).
     pub tags_skipped_conflict: u64,
     /// Primary reads matched in the DB but which received no new tag (every
-    /// candidate tag already existed and was skipped).
+    /// candidate tag already existed, or was dropped for a length mismatch).
     pub reads_matched_no_new_tags: u64,
     /// Secondary/supplementary alignments written unchanged (never tag-eligible).
     pub reads_secondary_supplementary: u64,
+    /// Primary reads whose base-modification tags were dropped because the
+    /// aligned SEQ length differs from the source's (or the source's MN does).
+    pub reads_length_mismatch: u64,
+    /// Subset of `reads_length_mismatch` fully explained by hard clipping.
+    pub reads_length_mismatch_hard_clipped: u64,
 }
 
 // ── public functions ──────────────────────────────────────────────────────────
+
+/// Fail if `output` is the same file as any of `inputs`. Opening the writer
+/// truncates the output, so writing over an input destroys it — mid-read for the
+/// aligned file, which yields a silently truncated result. Compares the files
+/// themselves, not path strings, so aliases (`..`, symlinks, hard links) are caught.
+pub fn ensure_output_distinct(output: &Path, inputs: &[&Path]) -> Result<()> {
+    for input in inputs {
+        if same_file(output, input)? {
+            bail!(
+                "Output '{}' is the same file as input '{}'; choose a different output path",
+                output.display(),
+                input.display()
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Read all source BAMs and store the requested tags in a Sled database keyed
 /// by read name.
@@ -165,6 +207,7 @@ pub fn collect_tags(
             if !found_tags.is_empty() {
                 let tag_data = TagData {
                     tags: found_tags.clone(),
+                    seq_len: record.seq_len() as u32,
                 };
                 let encoded =
                     postcard::to_allocvec(&tag_data).context("serializing tag data")?;
@@ -213,9 +256,12 @@ pub fn write_new_bam(
     no_index: bool,
     index_format: IndexFormat,
     on_conflict: ConflictMode,
+    on_length_mismatch: LengthMismatchMode,
     cache_mb: usize,
     reference: Option<&Path>,
 ) -> Result<TransferStats> {
+    ensure_output_distinct(output, &[&aligned_bam])?;
+
     let db = sled::Config::default()
         .path(db_path)
         .cache_capacity((cache_mb * 1024 * 1024) as u64)
@@ -256,6 +302,8 @@ pub fn write_new_bam(
         tags_skipped_conflict: 0,
         reads_matched_no_new_tags: 0,
         reads_secondary_supplementary: 0,
+        reads_length_mismatch: 0,
+        reads_length_mismatch_hard_clipped: 0,
     };
 
     for result in reader.records() {
@@ -277,8 +325,68 @@ pub fn write_new_bam(
             .get(record_key(&record))
             .context("looking up read name in Sled DB")?
         {
-            let data: TagData =
+            let mut data: TagData =
                 postcard::from_bytes(&bytes).context("deserializing tag data from Sled DB")?;
+
+            // MM positions index into SEQ, so they are wrong on a record whose
+            // SEQ was clipped or trimmed relative to the source. Never transfer
+            // them there; other requested tags are unaffected.
+            if data.tags.keys().any(|t| MOD_TAGS.contains(t)) {
+                let aligned_len = record.seq_len();
+                let source_len = data.seq_len as usize;
+                let source_mn_ok = data
+                    .tags
+                    .get(b"MN")
+                    .and_then(aux_as_i64)
+                    .map_or(true, |mn| mn == source_len as i64);
+
+                if aligned_len != source_len || !source_mn_ok {
+                    let hard_clipped: usize = record
+                        .cigar()
+                        .iter()
+                        .map(|op| match op {
+                            Cigar::HardClip(n) => *n as usize,
+                            _ => 0,
+                        })
+                        .sum();
+                    let explained_by_clipping =
+                        source_mn_ok && hard_clipped > 0 && aligned_len + hard_clipped == source_len;
+
+                    if let LengthMismatchMode::Error = on_length_mismatch {
+                        bail!(
+                            "Read '{}' has SEQ length {} ({} hard-clipped) but its source \
+                             base-modification tags were made for length {}{} \
+                             (use --on-length-mismatch=skip to drop them instead)",
+                            String::from_utf8_lossy(record.qname()),
+                            aligned_len,
+                            hard_clipped,
+                            source_len,
+                            if source_mn_ok { "" } else { " and disagree with its MN tag" }
+                        );
+                    }
+
+                    stats.reads_length_mismatch += 1;
+                    if explained_by_clipping {
+                        stats.reads_length_mismatch_hard_clipped += 1;
+                    }
+                    if stats.reads_length_mismatch <= MAX_LENGTH_MISMATCH_WARNINGS {
+                        log::warn!(
+                            "Dropping base-modification tags for read '{}': SEQ length {} \
+                             ({} hard-clipped) vs source length {}{}",
+                            String::from_utf8_lossy(record.qname()),
+                            aligned_len,
+                            hard_clipped,
+                            source_len,
+                            if source_mn_ok { "" } else { " (source MN disagrees)" }
+                        );
+                        if stats.reads_length_mismatch == MAX_LENGTH_MISMATCH_WARNINGS {
+                            log::warn!("Further length mismatches are only counted");
+                        }
+                    }
+                    data.tags.retain(|t, _| !MOD_TAGS.contains(t));
+                }
+            }
+
             let mut got_tag = false;
 
             for (tag_array, tag_value) in data.tags {
@@ -390,6 +498,27 @@ pub fn write_new_bam(
 
 // ── private helpers ───────────────────────────────────────────────────────────
 
+/// Whether two paths refer to the same existing file. A path that does not exist
+/// yet (the usual case for the output) cannot be another file.
+fn same_file(a: &Path, b: &Path) -> Result<bool> {
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return Ok(false);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (meta_a, meta_b);
+        let canon = |p: &Path| {
+            std::fs::canonicalize(p).with_context(|| format!("resolving '{}'", p.display()))
+        };
+        Ok(canon(a)? == canon(b)?)
+    }
+}
+
 /// One reserved byte identifying which mate of a template a record belongs to.
 /// The two mates of a pair share a QNAME, so keying on the name alone collides
 /// them. Valid SAM QNAMEs never contain bytes 0x00–0x03, so appending this suffix
@@ -410,6 +539,19 @@ fn record_key(record: &bam::record::Record) -> Vec<u8> {
     key.extend_from_slice(qname);
     key.push(mate_suffix(record));
     key
+}
+
+/// The value of an integer-typed aux tag, or `None` for any other type.
+fn aux_as_i64(value: &SerializableAux) -> Option<i64> {
+    match *value {
+        SerializableAux::I8(v) => Some(v.into()),
+        SerializableAux::U8(v) => Some(v.into()),
+        SerializableAux::I16(v) => Some(v.into()),
+        SerializableAux::U16(v) => Some(v.into()),
+        SerializableAux::I32(v) => Some(v.into()),
+        SerializableAux::U32(v) => Some(v.into()),
+        _ => None,
+    }
 }
 
 fn convert_aux_to_serializable(value: Aux) -> SerializableAux {

@@ -18,7 +18,10 @@
 //!   read1  chr1:100  MM="C+m,0,0,0;"   (conflict test target)
 //!   read2  chr1:200  (no tags)
 
-use tagporter::{collect_tags, write_new_bam, ConflictMode, IndexFormat, TransferStats};
+use tagporter::{
+    collect_tags, ensure_output_distinct, write_new_bam, ConflictMode, IndexFormat,
+    LengthMismatchMode, TransferStats,
+};
 use rust_htslib::bam::{self, record::Aux, Read};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -77,6 +80,7 @@ fn run(
         true,
         IndexFormat::Bai,
         on_conflict,
+        LengthMismatchMode::Skip,
         128,
         None,
     )
@@ -275,6 +279,7 @@ fn test_conflict_error_returns_err() {
         true,
         IndexFormat::Bai,
         ConflictMode::Error,
+        LengthMismatchMode::Skip,
         128,
         None,
     );
@@ -313,6 +318,7 @@ fn test_cram_roundtrip_with_reference() {
         true, // no_index
         IndexFormat::Bai,
         ConflictMode::Skip,
+        LengthMismatchMode::Skip,
         128,
         Some(&reference),
     )
@@ -354,6 +360,7 @@ fn test_sam_output_with_indexing_succeeds() {
         false, // indexing ON — must not error for SAM
         IndexFormat::Bai,
         ConflictMode::Skip,
+        LengthMismatchMode::Skip,
         128,
         None,
     )
@@ -440,6 +447,7 @@ fn test_paired_end_mates_get_distinct_tags() {
         true,
         IndexFormat::Bai,
         ConflictMode::Skip,
+        LengthMismatchMode::Skip,
         128,
         None,
     )
@@ -499,6 +507,7 @@ fn test_secondary_alignment_written_without_tags() {
         true,
         IndexFormat::Bai,
         ConflictMode::Skip,
+        LengthMismatchMode::Skip,
         128,
         None,
     )
@@ -516,4 +525,281 @@ fn test_secondary_alignment_written_without_tags() {
         records[1].aux(b"MM").is_err(),
         "secondary read1 must not be tagged"
     );
+}
+
+/// Regression test: writing the output over the aligned input must be refused
+/// before the writer truncates it. Previously this "succeeded" (exit 0) while
+/// leaving only the few records htslib had already buffered. Aliases of the same
+/// file (`..` components, symlinks) must be caught too, and the input left intact.
+#[test]
+fn test_output_same_as_aligned_input_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let aligned = tmp.path().join("aln.bam");
+    std::fs::copy(fixture("aligned.bam"), &aligned).unwrap();
+    let original = std::fs::read(&aligned).unwrap();
+
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut aliases = vec![aligned.clone(), tmp.path().join("sub/../aln.bam")];
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("link.bam");
+        std::os::unix::fs::symlink(&aligned, &link).unwrap();
+        aliases.push(link);
+    }
+
+    let db_path = tmp.path().join("_sled_db");
+    collect_tags(&[fixture("source.bam")], &db_path, 1, &["MM".to_string()], 128, None).unwrap();
+    for output in &aliases {
+        let err = write_new_bam(
+            &db_path,
+            1,
+            aligned.clone(),
+            output,
+            true,
+            IndexFormat::Bai,
+            ConflictMode::Skip,
+            LengthMismatchMode::Skip,
+            128,
+            None,
+        )
+        .expect_err(&format!("output '{}' aliases the input", output.display()));
+        assert!(err.to_string().contains("same file"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&aligned).unwrap(), original, "input must be untouched");
+    }
+}
+
+/// The source BAMs are protected as well, and a distinct (not yet existing)
+/// output path passes the check.
+#[test]
+fn test_ensure_output_distinct_checks_every_input() {
+    let tmp = TempDir::new().unwrap();
+    let aligned = fixture("aligned.bam");
+    let source = fixture("source.bam");
+    let inputs = [aligned.as_path(), source.as_path()];
+
+    assert!(ensure_output_distinct(&source, &inputs).is_err());
+    assert!(ensure_output_distinct(&tmp.path().join("new.bam"), &inputs).is_ok());
+}
+
+// ── sequence-length validation of base-modification tags ─────────────────────
+
+/// Write an unaligned source BAM holding one read, `read1`, with `seq` and `tags`.
+fn write_source_read(path: &Path, seq: &[u8], tags: Vec<(&[u8; 2], Aux)>) {
+    let header = single_contig_header(100_000);
+    let mut w = bam::Writer::from_path(path, &header, bam::Format::Bam).unwrap();
+    let mut rec = bam::record::Record::new();
+    rec.set(b"read1", None, seq, &vec![30u8; seq.len()]);
+    rec.set_flags(0x4);
+    for (tag, value) in tags {
+        rec.push_aux(tag, value).unwrap();
+    }
+    w.write(&rec).unwrap();
+}
+
+/// Write an aligned BAM holding one primary alignment of `read1`.
+fn write_aligned_read(path: &Path, flags: u16, cigar: Vec<bam::record::Cigar>, seq: &[u8]) {
+    let header = single_contig_header(100_000);
+    let mut w = bam::Writer::from_path(path, &header, bam::Format::Bam).unwrap();
+    let mut rec = bam::record::Record::new();
+    rec.set(
+        b"read1",
+        Some(&bam::record::CigarString(cigar)),
+        seq,
+        &vec![30u8; seq.len()],
+    );
+    rec.set_flags(flags);
+    rec.set_tid(0);
+    rec.set_pos(100);
+    w.write(&rec).unwrap();
+}
+
+/// Transfer `tags` from tmp/src.bam to tmp/aln.bam and return the output record.
+fn transfer_one(
+    tmp: &TempDir,
+    tags: &[&str],
+    on_length_mismatch: LengthMismatchMode,
+) -> anyhow::Result<(bam::record::Record, TransferStats)> {
+    let db_path = tmp.path().join("_sled_db");
+    let output_path = tmp.path().join("out.bam");
+    let tags_owned: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+    collect_tags(&[tmp.path().join("src.bam")], &db_path, 1, &tags_owned, 128, None)?;
+    let stats = write_new_bam(
+        &db_path,
+        1,
+        tmp.path().join("aln.bam"),
+        &output_path,
+        true,
+        IndexFormat::Bai,
+        ConflictMode::Skip,
+        on_length_mismatch,
+        128,
+        None,
+    )?;
+    let mut reader = bam::Reader::from_path(&output_path)?;
+    let mut records = read_all(&mut reader);
+    assert_eq!(records.len(), 1, "the read itself must always be written");
+    Ok((records.remove(0), stats))
+}
+
+/// Source read1: ACGTACGT with one call on its first C, plus MN and optionally RG.
+fn methylated_source(tmp: &TempDir, mn: i32, rg: Option<&str>) {
+    let ml = [200u8];
+    let mut tags: Vec<(&[u8; 2], Aux)> = vec![
+        (b"MM", Aux::String("C+m,0;")),
+        (b"ML", Aux::ArrayU8((&ml[..]).into())),
+        (b"MN", Aux::I32(mn)),
+    ];
+    if let Some(rg) = rg {
+        tags.push((b"RG", Aux::String(rg)));
+    }
+    write_source_read(&tmp.path().join("src.bam"), b"ACGTACGT", tags);
+}
+
+fn assert_no_mod_tags(rec: &bam::record::Record) {
+    for tag in [b"MM", b"ML", b"MN"] {
+        assert!(
+            rec.aux(tag).is_err(),
+            "{} must not be transferred onto a length-mismatched read",
+            String::from_utf8_lossy(tag)
+        );
+    }
+}
+
+fn assert_buckets_partition(stats: &TransferStats) {
+    assert_eq!(
+        stats.reads_tagged
+            + stats.reads_unmatched
+            + stats.reads_matched_no_new_tags
+            + stats.reads_secondary_supplementary,
+        stats.total_aligned,
+        "outcome buckets must sum to total_aligned"
+    );
+}
+
+/// Regression test for review finding #3: a hard-clipped primary (2H6M) must not
+/// receive the source's MM/ML, whose positions count from the clipped-off bases.
+/// Previously the tags were copied verbatim and the call shifted to another C.
+#[test]
+fn test_hard_clipped_primary_drops_mod_tags() {
+    use rust_htslib::bam::record::Cigar;
+    let tmp = TempDir::new().unwrap();
+    methylated_source(&tmp, 8, None);
+    write_aligned_read(
+        &tmp.path().join("aln.bam"),
+        0,
+        vec![Cigar::HardClip(2), Cigar::Match(6)],
+        b"GTACGT",
+    );
+
+    let (rec, stats) = transfer_one(&tmp, &["MM", "ML", "MN"], LengthMismatchMode::Skip).unwrap();
+    assert_no_mod_tags(&rec);
+    assert_eq!(stats.reads_length_mismatch, 1);
+    assert_eq!(stats.reads_length_mismatch_hard_clipped, 1);
+    assert_eq!(stats.reads_tagged, 0);
+    assert_eq!(stats.reads_matched_no_new_tags, 1);
+    assert_buckets_partition(&stats);
+}
+
+/// A read trimmed before alignment (shorter SEQ, no hard clip) is a mismatch
+/// that hard clipping does not explain.
+#[test]
+fn test_trimmed_read_drops_mod_tags() {
+    use rust_htslib::bam::record::Cigar;
+    let tmp = TempDir::new().unwrap();
+    methylated_source(&tmp, 8, None);
+    write_aligned_read(&tmp.path().join("aln.bam"), 0, vec![Cigar::Match(6)], b"ACGTAC");
+
+    let (rec, stats) = transfer_one(&tmp, &["MM", "ML", "MN"], LengthMismatchMode::Skip).unwrap();
+    assert_no_mod_tags(&rec);
+    assert_eq!(stats.reads_length_mismatch, 1);
+    assert_eq!(stats.reads_length_mismatch_hard_clipped, 0);
+    assert_buckets_partition(&stats);
+}
+
+/// Only base-modification tags depend on SEQ; other requested tags (here RG)
+/// are still transferred to a length-mismatched read.
+#[test]
+fn test_length_mismatch_keeps_other_tags() {
+    use rust_htslib::bam::record::Cigar;
+    let tmp = TempDir::new().unwrap();
+    methylated_source(&tmp, 8, Some("grp1"));
+    write_aligned_read(
+        &tmp.path().join("aln.bam"),
+        0,
+        vec![Cigar::HardClip(2), Cigar::Match(6)],
+        b"GTACGT",
+    );
+
+    let (rec, stats) =
+        transfer_one(&tmp, &["MM", "ML", "MN", "RG"], LengthMismatchMode::Skip).unwrap();
+    assert_no_mod_tags(&rec);
+    match rec.aux(b"RG").unwrap() {
+        Aux::String(s) => assert_eq!(s, "grp1"),
+        other => panic!("RG: expected String, got {other:?}"),
+    }
+    assert_eq!(stats.reads_tagged, 1, "RG still counts as a transferred tag");
+    assert_eq!(stats.reads_length_mismatch, 1);
+    assert_buckets_partition(&stats);
+}
+
+/// With --on-length-mismatch=error the run fails and names the read.
+#[test]
+fn test_length_mismatch_error_mode_returns_err() {
+    use rust_htslib::bam::record::Cigar;
+    let tmp = TempDir::new().unwrap();
+    methylated_source(&tmp, 8, None);
+    write_aligned_read(
+        &tmp.path().join("aln.bam"),
+        0,
+        vec![Cigar::HardClip(2), Cigar::Match(6)],
+        b"GTACGT",
+    );
+
+    let err = transfer_one(&tmp, &["MM", "ML", "MN"], LengthMismatchMode::Error)
+        .expect_err("length mismatch must abort in error mode");
+    let msg = err.to_string();
+    assert!(msg.contains("read1"), "error should name the read: {msg}");
+    assert!(msg.contains("--on-length-mismatch"), "error should hint at the flag: {msg}");
+}
+
+/// Equal lengths transfer normally, including MN, and a reverse-strand alignment
+/// (SEQ stored reverse-complemented, same length) is not a mismatch.
+#[test]
+fn test_equal_length_reverse_strand_transfers_mod_tags_and_mn() {
+    use rust_htslib::bam::record::Cigar;
+    let tmp = TempDir::new().unwrap();
+    methylated_source(&tmp, 8, None);
+    // ACGTACGT is its own reverse complement.
+    write_aligned_read(&tmp.path().join("aln.bam"), 0x10, vec![Cigar::Match(8)], b"ACGTACGT");
+
+    let (rec, stats) = transfer_one(&tmp, &["MM", "ML", "MN"], LengthMismatchMode::Skip).unwrap();
+    assert_eq!(mm_string(&rec), "C+m,0;");
+    let mn = match rec.aux(b"MN").unwrap() {
+        Aux::I8(v) => v as i64,
+        Aux::U8(v) => v as i64,
+        Aux::I16(v) => v as i64,
+        Aux::U16(v) => v as i64,
+        Aux::I32(v) => v as i64,
+        Aux::U32(v) => v as i64,
+        other => panic!("MN: expected integer, got {other:?}"),
+    };
+    assert_eq!(mn, 8);
+    assert_eq!(stats.reads_length_mismatch, 0);
+    assert_eq!(stats.reads_tagged, 1);
+}
+
+/// A source whose own MN disagrees with its SEQ already carries invalid MM/ML;
+/// they are dropped even though the aligned and source lengths agree.
+#[test]
+fn test_inconsistent_source_mn_drops_mod_tags() {
+    use rust_htslib::bam::record::Cigar;
+    let tmp = TempDir::new().unwrap();
+    methylated_source(&tmp, 9, None);
+    write_aligned_read(&tmp.path().join("aln.bam"), 0, vec![Cigar::Match(8)], b"ACGTACGT");
+
+    let (rec, stats) = transfer_one(&tmp, &["MM", "ML", "MN"], LengthMismatchMode::Skip).unwrap();
+    assert_no_mod_tags(&rec);
+    assert_eq!(stats.reads_length_mismatch, 1);
+    assert_eq!(stats.reads_length_mismatch_hard_clipped, 0);
+    assert_buckets_partition(&stats);
 }
