@@ -36,6 +36,15 @@ cargo check
 
 Progress output goes to stderr via `env_logger`. Control verbosity with `RUST_LOG=warn/info/debug` or `--quiet`.
 
+## Releasing
+
+[.github/workflows/release.yml](.github/workflows/release.yml) builds `tagporter-{linux-x86_64,linux-aarch64,macos-aarch64,macos-x86_64}` and publishes them with a `SHA256SUMS` file.
+
+- Bump `version` in `Cargo.toml`, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`. The workflow fails if the tag and `Cargo.toml` version differ.
+- A suffix (`vX.Y.Z-rc1`) publishes a pre-release; the suffix is ignored for the version check.
+- "Run workflow" in the Actions tab (`workflow_dispatch`) builds artifacts without releasing.
+- Linux builds run in `manylinux_2_28` containers and fail if the binary needs a glibc newer than 2.28. macOS builds target macOS 11 (`MACOSX_DEPLOYMENT_TARGET`).
+
 ## Architecture
 
 The tool uses a **three-phase pipeline** with an embedded [Sled](https://github.com/spacejam/sled) key-value database as intermediate storage (avoids loading large datasets into RAM):

@@ -12,7 +12,10 @@ A high-performance Rust tool for transferring auxiliary tags from source BAM fil
 
 ### Option 1: Download Pre-built Binaries (Recommended)
 
-Pre-built binaries are available for Linux and macOS on the [Releases](https://github.com/smaht-dac/TagPorter/releases) page.
+Pre-built binaries are available for Linux and macOS on the [Releases](https://github.com/smaht-dac/TagPorter/releases) page. They have no runtime dependencies beyond the operating system:
+
+- **Linux** (x86_64, ARM64): glibc 2.28 or newer — e.g. RHEL/Rocky/Alma 8+, Ubuntu 20.04+, Debian 10+
+- **macOS** (Apple Silicon, Intel): macOS 11 or newer
 
 ```bash
 # Download the latest release for your platform
@@ -20,6 +23,11 @@ Pre-built binaries are available for Linux and macOS on the [Releases](https://g
 wget https://github.com/smaht-dac/TagPorter/releases/latest/download/tagporter-linux-x86_64
 chmod +x tagporter-linux-x86_64
 sudo mv tagporter-linux-x86_64 /usr/local/bin/tagporter
+
+# Linux (ARM64)
+wget https://github.com/smaht-dac/TagPorter/releases/latest/download/tagporter-linux-aarch64
+chmod +x tagporter-linux-aarch64
+sudo mv tagporter-linux-aarch64 /usr/local/bin/tagporter
 
 # macOS (Apple Silicon)
 wget https://github.com/smaht-dac/TagPorter/releases/latest/download/tagporter-macos-aarch64
@@ -32,6 +40,8 @@ chmod +x tagporter-macos-x86_64
 sudo mv tagporter-macos-x86_64 /usr/local/bin/tagporter
 ```
 
+Each release also includes a `SHA256SUMS` file for verifying downloads (`sha256sum -c SHA256SUMS --ignore-missing`).
+
 Verify installation:
 ```bash
 tagporter --version
@@ -41,7 +51,7 @@ tagporter --version
 
 #### Prerequisites
 
-- Rust 1.70 or higher
+- Rust 1.85 or higher (the crate uses the 2024 edition)
 - Cargo (comes with Rust)
 
 #### Build Instructions
